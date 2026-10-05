@@ -1,2 +1,2 @@
-candle_close_utc,signal_price_usdt,ema300_usdt,long_threshold_1_02x_usdt,flat_threshold_0_97x_usdt,applicable_threshold_usdt,difference_usdt,difference_pct,previous_target,target,action_transition,status
-2026-10-05T07:59:59.999Z,86252.76000000,75136.63205446,76639.36469554,72882.53309282,72882.53309282,13370.22690718,18.34489876,LONG,LONG,target retained LONG,BACKFILLED_LATEST_COMPLETED_CANDLE
+candle_close_utc,signal_price_usdt,ema300_usdt,long_threshold_1_02x_usdt,flat_threshold_0_97x_usdt,applicable_threshold_usdt,difference_usdt,difference_pct,previous_target,target,action_transition,status,current_spot_price_usdt,spot_ticker_observed_utc
+2026-10-05T07:59:59.999Z,86252.76000000,75136.63205446,76639.36469554,72882.53309282,72882.53309282,13370.22690718,18.34489876,LONG,LONG,target retained LONG,BACKFILLED_LATEST_COMPLETED_CANDLE,86105.46000000,2026-10-05T12:21:09Z
