@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 INTERVAL = "8h"
 INTERVAL_MS = 8 * 60 * 60 * 1000
 EMA_PERIOD = 300
+MIN_RECONSTRUCTION_CANDLES = EMA_PERIOD
 LONG_MULTIPLIER = 1.02
 FLAT_MULTIPLIER = 0.97
 API_PAGE_LIMIT = 1000
@@ -33,6 +34,20 @@ USER_AGENT = "binance-ema300-signal-monitor/1.0"
 
 class MonitorError(Exception):
     """A safe-to-display configuration, data, or network error."""
+
+
+class PartialDurationCandleError(MonitorError):
+    """A kline closes before its nominal interval ends."""
+
+    def __init__(self, open_time_ms: int, close_time_ms: int, expected_close_time_ms: int):
+        self.open_time_ms = open_time_ms
+        self.close_time_ms = close_time_ms
+        self.expected_close_time_ms = expected_close_time_ms
+        super().__init__(
+            f"Kline at {utc_timestamp(open_time_ms)} has an early close timestamp "
+            f"{utc_timestamp(close_time_ms)}; a full 8-hour bar would close at "
+            f"{utc_timestamp(expected_close_time_ms)}."
+        )
 
 
 @dataclass(frozen=True)
@@ -142,7 +157,10 @@ def parse_candle(row: Any) -> Candle:
         raise MonitorError(
             f"Kline open time {open_time} is not aligned to an 8-hour UTC boundary."
         )
-    if close_time != open_time + INTERVAL_MS - 1:
+    expected_close_time = open_time + INTERVAL_MS - 1
+    if close_time < expected_close_time:
+        raise PartialDurationCandleError(open_time, close_time, expected_close_time)
+    if close_time > expected_close_time:
         raise MonitorError(
             f"Kline at {utc_timestamp(open_time)} has an unexpected close timestamp; refusing to process it."
         )
@@ -191,6 +209,25 @@ def ensure_contiguous(candles: Iterable[Candle], first_expected_open: int | None
         previous_open = candle.open_time_ms
 
 
+def historical_gap_ranges(candles: Iterable[Candle]) -> list[tuple[int, int, int]]:
+    """Return (previous open, next open, missing intervals) without filling gaps."""
+    gaps: list[tuple[int, int, int]] = []
+    previous_open: int | None = None
+    for candle in candles:
+        current_open = candle.open_time_ms
+        if previous_open is not None:
+            delta = current_open - previous_open
+            if delta <= 0:
+                raise MonitorError("Historical klines are duplicate or out of order; no state was changed.")
+            if delta % INTERVAL_MS:
+                raise MonitorError("Historical klines are not separated by whole 8-hour intervals; no state was changed.")
+            missing = delta // INTERVAL_MS - 1
+            if missing:
+                gaps.append((previous_open, current_open, missing))
+        previous_open = current_open
+    return gaps
+
+
 def empty_state(config: dict[str, Any]) -> MonitorState:
     return MonitorState(
         config=dict(config),
@@ -202,8 +239,13 @@ def empty_state(config: dict[str, Any]) -> MonitorState:
     )
 
 
-def apply_candle(state: MonitorState, candle: Candle) -> CandleEvent:
-    if state.last_processed_open_time_ms is not None:
+def apply_candle(
+    state: MonitorState,
+    candle: Candle,
+    *,
+    require_contiguous: bool = True,
+) -> CandleEvent:
+    if require_contiguous and state.last_processed_open_time_ms is not None:
         expected = state.last_processed_open_time_ms + INTERVAL_MS
         if candle.open_time_ms != expected:
             raise MonitorError(
@@ -362,6 +404,7 @@ class BinancePublicClient:
         self.timeout = timeout
         self.sleep = sleep
         self.stderr = stderr
+        self.last_skipped_historical_rows = 0
 
     def fetch_page(self, symbol: str, start_time_ms: int, limit: int = API_PAGE_LIMIT) -> list[Any]:
         query = urllib.parse.urlencode(
@@ -409,27 +452,69 @@ class BinancePublicClient:
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise MonitorError(f"Binance returned invalid JSON: {exc}") from exc
 
-    def fetch_all(self, symbol: str, start_time_ms: int = 0) -> list[Candle]:
+    def fetch_all(
+        self,
+        symbol: str,
+        start_time_ms: int = 0,
+        *,
+        allow_historical_short_rows: bool = False,
+    ) -> list[Candle]:
         cursor = start_time_ms
         candles: list[Candle] = []
+        previous_raw_open: int | None = None
+        skipped_historical_rows = 0
+        self.last_skipped_historical_rows = 0
+        reconstruction_cutoff = (
+            expected_latest_completed_open(int(time.time() * 1000))
+            if allow_historical_short_rows
+            else None
+        )
         while True:
             rows = self.fetch_page(symbol, cursor, API_PAGE_LIMIT)
             if not rows:
                 break
-            page = [parse_candle(row) for row in rows]
-            if len(page) > API_PAGE_LIMIT:
+            if len(rows) > API_PAGE_LIMIT:
                 raise MonitorError("Binance returned more klines than the requested page limit.")
-            if any(page[index].open_time_ms >= page[index + 1].open_time_ms for index in range(len(page) - 1)):
-                raise MonitorError("Binance returned duplicate or out-of-order klines.")
-            if page[0].open_time_ms < cursor:
-                raise MonitorError("Binance returned klines before the requested start time.")
-            if candles and page[0].open_time_ms <= candles[-1].open_time_ms:
-                raise MonitorError("Kline pagination did not advance monotonically.")
-            candles.extend(page)
-            if len(page) < API_PAGE_LIMIT:
+            last_row_close_time: int | None = None
+            for row in rows:
+                candle: Candle | None
+                try:
+                    candle = parse_candle(row)
+                except PartialDurationCandleError as exc:
+                    row_open_time = exc.open_time_ms
+                    if (
+                        reconstruction_cutoff is None
+                        or row_open_time >= reconstruction_cutoff
+                    ):
+                        raise
+                    candle = None
+                    skipped_historical_rows += 1
+                    self.last_skipped_historical_rows = skipped_historical_rows
+                    print(
+                        f"[history-warning] skipped short-duration historical 8h kline at "
+                        f"{utc_timestamp(exc.open_time_ms)}: closeTime="
+                        f"{utc_timestamp(exc.close_time_ms)}, expected="
+                        f"{utc_timestamp(exc.expected_close_time_ms)}; it is not treated as a "
+                        "completed full bar.",
+                        file=self.stderr,
+                        flush=True,
+                    )
+                else:
+                    row_open_time = candle.open_time_ms
+                row_close_time = int(row[6])
+                if row_open_time < cursor:
+                    raise MonitorError("Binance returned klines before the requested start time.")
+                if previous_raw_open is not None and row_open_time <= previous_raw_open:
+                    raise MonitorError("Binance returned duplicate or out-of-order klines.")
+                previous_raw_open = row_open_time
+                last_row_close_time = row_close_time
+                if candle is not None:
+                    candles.append(candle)
+            if len(rows) < API_PAGE_LIMIT:
                 break
-            cursor = page[-1].open_time_ms + 1
-            if page[-1].close_time_ms >= int(time.time() * 1000):
+            assert previous_raw_open is not None
+            cursor = previous_raw_open + 1
+            if last_row_close_time is not None and last_row_close_time >= int(time.time() * 1000):
                 break
         return candles
 
@@ -510,6 +595,12 @@ class Monitor:
                     f"[startup] {self.symbol} Spot {INTERVAL} UTC EMA{EMA_PERIOD}; no local state found. "
                     "Reconstructing from all available completed public klines (this may take several requests)."
                 )
+                self._say(
+                    "[history-policy] first run only: skip historical klines with an early closeTime "
+                    "(never process them as full bars); preserve gaps without synthesizing candles; "
+                    f"require at least {MIN_RECONSTRUCTION_CANDLES} valid completed bars. "
+                    "Saved-state updates remain strict and contiguous."
+                )
                 self.startup_announced = True
             start_time = 0
         else:
@@ -519,7 +610,11 @@ class Monitor:
             assert state.last_processed_open_time_ms is not None
             start_time = state.last_processed_open_time_ms + 1
 
-        fetched = self.client.fetch_all(self.symbol, start_time)
+        fetched = self.client.fetch_all(
+            self.symbol,
+            start_time,
+            allow_historical_short_rows=state is None,
+        )
         now_ms = int(time.time() * 1000)
         if not fetched:
             if state is None:
@@ -538,16 +633,42 @@ class Monitor:
         if state is None:
             if not finished:
                 raise MonitorError("No completed historical candles are available; initialization did not occur.")
-            ensure_contiguous(finished)
+            if len(finished) < MIN_RECONSTRUCTION_CANDLES:
+                raise MonitorError(
+                    f"Only {len(finished)} valid full-duration completed 8-hour candles are available; "
+                    f"at least {MIN_RECONSTRUCTION_CANDLES} are required for EMA{EMA_PERIOD} history. "
+                    "No state was changed."
+                )
+            gaps = historical_gap_ranges(finished)
+            skipped = getattr(self.client, "last_skipped_historical_rows", 0)
+            if skipped:
+                self._say(
+                    f"[history-warning] omitted {skipped} early-close historical row(s); none was used "
+                    "as a candle or included in the EMA."
+                )
+            if gaps:
+                missing_total = sum(gap[2] for gap in gaps)
+                self._say(
+                    f"[history-warning] {missing_total} missing 8-hour interval(s) across {len(gaps)} "
+                    "historical gap(s); no candles were synthesized. The EMA uses only valid returned bars."
+                )
+                for previous_open, next_open, missing in gaps[:10]:
+                    self._say(
+                        f"[history-gap] {missing} missing open(s) between "
+                        f"{utc_timestamp(previous_open)} and {utc_timestamp(next_open)}."
+                    )
+                if len(gaps) > 10:
+                    self._say(f"[history-gap] {len(gaps) - 10} additional gap(s) not listed individually.")
             state = empty_state(self.config)
             for candle in finished:
-                apply_candle(state, candle)
+                apply_candle(state, candle, require_contiguous=False)
             save_state(state, self.state_path)
             self._say(
                 f"[initialized] replayed {len(finished)} completed candles from "
                 f"{utc_timestamp(finished[0].open_time_ms)} through "
                 f"{utc_timestamp(finished[-1].open_time_ms)}; seed=first completed close; "
-                f"initial target=FLAT; reconstructed target={state.target}."
+                f"initial target=FLAT; reconstructed target={state.target}; "
+                f"valid bars={len(finished)}; gaps={len(gaps)}."
             )
             self._startup_status(state)
             return
