@@ -1,12 +1,19 @@
 import io
+import json
 import tempfile
 import time
+import urllib.error
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from binance_ema300_monitor import (
+    AdditionalSignalMonitor,
+    AdditionalSignalState,
     BinancePublicClient,
     Candle,
+    DAILY_INTERVAL,
+    DAILY_INTERVAL_MS,
     EMA_PERIOD,
     INTERVAL_MS,
     Monitor,
@@ -18,8 +25,12 @@ from binance_ema300_monitor import (
     historical_gap_ranges,
     load_state,
     make_config,
+    make_additional_config,
+    next_daily_ema_target,
+    next_donchian_target,
     next_target,
     parse_candle,
+    save_additional_state,
     save_state,
     update_ema,
 )
@@ -44,6 +55,72 @@ class SignalRuleTests(unittest.TestCase):
         self.assertAlmostEqual(second, 12.0)  # alpha = 2 / (3 + 1)
         self.assertAlmostEqual(third, 12.0)
 
+    def test_donchian_entry_and_exit_are_strict_and_use_prior_windows(self):
+        prior = [float(value) for value in range(1, 21)]
+        self.assertEqual(next_donchian_target(20.0, prior, "CASH"), ("CASH", 20.0, 11.0))
+        self.assertEqual(next_donchian_target(20.01, prior, "CASH"), ("BTC", 20.0, 11.0))
+        self.assertEqual(next_donchian_target(11.0, prior, "BTC"), ("BTC", 20.0, 11.0))
+        self.assertEqual(next_donchian_target(10.99, prior, "BTC"), ("CASH", 20.0, 11.0))
+
+    def test_daily_ema_equal_or_below_exits_to_cash(self):
+        self.assertEqual(next_daily_ema_target(100.01, 100.0), "BTC")
+        self.assertEqual(next_daily_ema_target(100.0, 100.0), "CASH")
+        self.assertEqual(next_daily_ema_target(99.99, 100.0), "CASH")
+
+
+class AdditionalSignalMonitorTests(unittest.TestCase):
+    def test_reports_both_independent_transitions_in_one_check(self):
+        now_ms = int(time.time() * 1000)
+        current_8h_open = (now_ms // INTERVAL_MS) * INTERVAL_MS
+        latest_8h_open = current_8h_open - INTERVAL_MS
+        previous_8h_open = latest_8h_open - INTERVAL_MS
+        current_day_open = (now_ms // DAILY_INTERVAL_MS) * DAILY_INTERVAL_MS
+        latest_day_open = current_day_open - DAILY_INTERVAL_MS
+        previous_day_open = latest_day_open - DAILY_INTERVAL_MS
+        config = make_additional_config("BTCUSDT", "https://api.binance.com")
+        state = AdditionalSignalState(
+            config=config,
+            donchian_target="CASH",
+            last_8h_open_time_ms=previous_8h_open,
+            recent_8h_closes=[100.0] * 20,
+            daily_ema6=100.0,
+            daily_ema24=100.0,
+            daily_target="CASH",
+            last_daily_open_time_ms=previous_day_open,
+        )
+
+        class FixtureClient:
+            def fetch_all(
+                self,
+                symbol,
+                start_time_ms=0,
+                *,
+                allow_historical_short_rows=False,
+                interval="8h",
+            ):
+                if interval == "8h":
+                    return [Candle(latest_8h_open, 101.0, latest_8h_open + INTERVAL_MS - 1)]
+                return [Candle(latest_day_open, 101.0, latest_day_open + DAILY_INTERVAL_MS - 1)]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "additional-state.json"
+            save_additional_state(state, state_path)
+            stdout = io.StringIO()
+            monitor = AdditionalSignalMonitor(
+                "BTCUSDT",
+                "https://api.binance.com",
+                state_path,
+                FixtureClient(),
+                stdout=stdout,
+                stderr=io.StringIO(),
+            )
+            events = monitor.run_once()
+
+        self.assertEqual([event.strategy for event in events], ["donchian-8h-20-10", "daily-ema6-24"])
+        self.assertEqual([event.target for event in events], ["BTC", "BTC"])
+        self.assertIn("[new-signal][donchian-8h-20-10] ENTER BTC", stdout.getvalue())
+        self.assertIn("[new-signal][daily-ema6-24] ENTER BTC", stdout.getvalue())
+
 
 class CandleAndStateTests(unittest.TestCase):
     def test_parse_rejects_short_duration_row_as_not_a_full_bar(self):
@@ -51,6 +128,41 @@ class CandleAndStateTests(unittest.TestCase):
         row = [open_time, "1", "1", "1", "7784.02", "1", open_time + 1_694_788]
         with self.assertRaises(PartialDurationCandleError):
             parse_candle(row)
+
+    def test_parse_accepts_a_completed_utc_daily_candle(self):
+        open_time = 1_704_067_200_000
+        candle = parse_candle(
+            [open_time, "1", "1", "1", "100", "1", open_time + DAILY_INTERVAL_MS - 1],
+            DAILY_INTERVAL,
+        )
+        self.assertEqual(candle.open_time_ms, open_time)
+        self.assertEqual(candle.close_price, 100.0)
+
+    def test_http_451_uses_binance_public_market_data_mirror(self):
+        stderr = io.StringIO()
+        client = BinancePublicClient("https://api.binance.com", stderr=stderr)
+        urls = []
+        rows = [[0, "1", "1", "1", "100", "1", INTERVAL_MS - 1]]
+
+        def fake_urlopen(request, timeout):
+            urls.append(request.full_url)
+            if request.full_url.startswith("https://api.binance.com/"):
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    451,
+                    "Unavailable for legal reasons",
+                    None,
+                    io.BytesIO(b"restricted"),
+                )
+            return io.BytesIO(json.dumps(rows).encode("utf-8"))
+
+        with patch("binance_ema300_monitor.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = client.fetch_page("BTCUSDT", 0, limit=1)
+
+        self.assertEqual(result, rows)
+        self.assertIn("https://data-api.binance.vision/api/v3/klines?", urls[1])
+        self.assertIn("interval=8h", urls[1])
+        self.assertIn("[endpoint-fallback]", stderr.getvalue())
 
     def test_incomplete_candle_is_excluded_until_its_close_timestamp_is_past(self):
         candles = [
@@ -188,6 +300,7 @@ class CandleAndStateTests(unittest.TestCase):
                 client,
                 stdout=stdout,
                 stderr=io.StringIO(),
+                enable_additional_signals=False,
             )
             monitor.run_once()
             restored = load_state(
@@ -243,6 +356,7 @@ class CandleAndStateTests(unittest.TestCase):
                 client,
                 stdout=stdout,
                 stderr=io.StringIO(),
+                enable_additional_signals=False,
             )
             monitor.run_once(once=False)
             monitor.run_once(once=False)
@@ -275,6 +389,7 @@ class CandleAndStateTests(unittest.TestCase):
                 FixtureClient(),
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
+                enable_additional_signals=False,
             )
             with self.assertRaisesRegex(MonitorError, "at least 300 are required"):
                 monitor.run_once()
@@ -309,6 +424,7 @@ class CandleAndStateTests(unittest.TestCase):
                 client,
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
+                enable_additional_signals=False,
             )
             with self.assertRaisesRegex(MonitorError, "Missing or out-of-order"):
                 monitor.run_once()
