@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.*.lock
+binance_ema300_state.json
+binance_additional_signals_state.json

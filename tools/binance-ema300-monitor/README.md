@@ -94,3 +94,20 @@ This is a local script, not a hosted or always-on service. It monitors only whil
 ## Tests
 
 The offline unit tests cover EMA recursion, LONG/FLAT hysteresis and deadband retention, strict Donchian thresholds, daily EMA equality exits, simultaneous independent signal changes, exclusion of incomplete candles, JSON state round-trip, startup-only short-row handling, gap reporting without synthesis, and the minimum history requirement. They use local fixtures and make no network requests.
+
+## CSV tracking and recurring delivery
+
+The existing `signal_results.csv` is the EMA300 evaluation/snapshot log; its schema is unchanged. The added rules use a separate `additional_signal_results.csv`, one row for each newly evaluated completed 8-hour Donchian candle or completed UTC daily EMA candle. It records strategy, market, interval, candle-close timestamp and price, previous/current targets, whether the signal changed, both relevant Donchian thresholds or daily EMA values, and the effective next interval/day. It is an **evaluation journal**, not actual trades, fills, or realized investment returns.
+
+```bash
+python3 binance_ema300_monitor.py --once \
+  --state-file /workspace/binance-ema300-monitor/binance_ema300_state.json \
+  --additional-state-file /workspace/binance-ema300-monitor/binance_additional_signals_state.json \
+  --additional-results-file /workspace/btc/tools/binance-ema300-monitor/additional_signal_results.csv
+```
+
+The added CSV is written **before** the additional-strategy state advances. Rows are deduplicated by strategy, symbol, and candle-close time, so retrying after a failed state save does not duplicate a row. File locking and atomic CSV replacement protect against concurrent CSV writers and partial writes; they do not make the two JSON states and alert delivery a single transaction. Only one monitor invocation should run at a time. Unchanged evaluations are logged but do not emit added-strategy alerts. The original EMA300 console output remains backward compatible; the recurring delivery instruction filters routine unchanged output.
+
+`RECOVERED_KNOWN_TRANSITION` marks the previously observed Donchian entry at 2026-10-21 07:59:59.999 UTC. `RECOVERED_LATEST_EVALUATION` marks the latest independently verified baseline evaluations. These recovered rows must not be sent as fresh alerts; no earlier performance history or trade execution is implied.
+
+The recurring Cue check uses the existing cadence of **00:02, 08:02, and 16:02 Asia/Kuala_Lumpur**. Its owning scheduled-task instruction is responsible for committing and pushing both CSVs to `master` even when targets are unchanged. The script itself does not push Git or deliver chat messages. Reports are intended for the user's **direct chat**, not a group, and only when a strategy changes. If any strategy changes, the report includes all three strategies and their relevant thresholds, clearly distinguishing changed signals from unchanged context. The schedule-owner must apply the updated instruction; editing these files alone does not update scheduling or chat routing.

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
+from signal_csv import append_evaluations, evaluation_row
+
 INTERVAL = "8h"
 INTERVAL_MS = 8 * 60 * 60 * 1000
 DAILY_INTERVAL = "1d"
@@ -773,6 +775,7 @@ class AdditionalSignalMonitor:
         client: BinancePublicClient,
         stdout: Any = sys.stdout,
         stderr: Any = sys.stderr,
+        results_path: Path | None = None,
     ) -> None:
         self.symbol = symbol
         self.base_url = normalize_base_url(base_url)
@@ -781,6 +784,7 @@ class AdditionalSignalMonitor:
         self.stdout = stdout
         self.stderr = stderr
         self.config = make_additional_config(symbol, self.base_url)
+        self.results_path = results_path or self.state_path.with_name("additional_signal_results.csv")
 
     def _say(self, message: str) -> None:
         print(message, file=self.stdout, flush=True)
@@ -885,6 +889,7 @@ class AdditionalSignalMonitor:
             )
 
         events: list[AdditionalSignalEvent] = []
+        evaluations: list[AdditionalSignalEvent] = []
         target8h = state.donchian_target
         recent_closes = list(state.recent_8h_closes)
         for candle in new8h:
@@ -892,21 +897,16 @@ class AdditionalSignalMonitor:
             target8h, highest_prior20, lowest_prior10 = next_donchian_target(
                 candle.close_price, recent_closes, target8h
             )
+            assert highest_prior20 is not None and lowest_prior10 is not None
+            evaluation = AdditionalSignalEvent(
+                strategy="donchian-8h-20-10", interval=INTERVAL, candle=candle,
+                previous_target=previous_target, target=target8h,
+                details={"highest_close_prior20": highest_prior20,
+                         "lowest_close_prior10": lowest_prior10},
+            )
+            evaluations.append(evaluation)
             if target8h != previous_target:
-                assert highest_prior20 is not None and lowest_prior10 is not None
-                events.append(
-                    AdditionalSignalEvent(
-                        strategy="donchian-8h-20-10",
-                        interval=INTERVAL,
-                        candle=candle,
-                        previous_target=previous_target,
-                        target=target8h,
-                        details={
-                            "highest_close_prior20": highest_prior20,
-                            "lowest_close_prior10": lowest_prior10,
-                        },
-                    )
-                )
+                events.append(evaluation)
             recent_closes = (recent_closes + [candle.close_price])[-20:]
 
         ema6 = state.daily_ema6
@@ -917,17 +917,14 @@ class AdditionalSignalMonitor:
             ema24 = update_ema(ema24, candle.close_price, period=24)
             previous_target = target_daily
             target_daily = next_daily_ema_target(ema6, ema24)
+            evaluation = AdditionalSignalEvent(
+                strategy="daily-ema6-24", interval=DAILY_INTERVAL, candle=candle,
+                previous_target=previous_target, target=target_daily,
+                details={"ema6": ema6, "ema24": ema24},
+            )
+            evaluations.append(evaluation)
             if target_daily != previous_target:
-                events.append(
-                    AdditionalSignalEvent(
-                        strategy="daily-ema6-24",
-                        interval=DAILY_INTERVAL,
-                        candle=candle,
-                        previous_target=previous_target,
-                        target=target_daily,
-                        details={"ema6": ema6, "ema24": ema24},
-                    )
-                )
+                events.append(evaluation)
 
         if new8h or new_daily:
             updated = AdditionalSignalState(
@@ -940,6 +937,12 @@ class AdditionalSignalMonitor:
                 daily_target=target_daily,
                 last_daily_open_time_ms=(new_daily[-1].open_time_ms if new_daily else state.last_daily_open_time_ms),
             )
+            try:
+                append_evaluations(self.results_path, [
+                    evaluation_row(event, self.symbol, utc_timestamp) for event in evaluations
+                ])
+            except (OSError, ValueError) as exc:
+                raise MonitorError(f"Could not journal additional signals: {exc}; state not advanced") from exc
             save_additional_state(updated, self.state_path)
         for event in events:
             self._report_event(event)
@@ -959,6 +962,7 @@ class Monitor:
         enable_additional_signals: bool = True,
         additional_client: BinancePublicClient | None = None,
         additional_base_url: str | None = None,
+        additional_results_path: Path | None = None,
     ) -> None:
         self.symbol = symbol
         self.base_url = normalize_base_url(base_url)
@@ -978,6 +982,7 @@ class Monitor:
                 additional_client or client,
                 stdout=stdout,
                 stderr=stderr,
+                results_path=additional_results_path,
             )
             if enable_additional_signals
             else None
@@ -1203,6 +1208,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="state path for Donchian 20/10 and daily EMA6/24 (default: alongside EMA300 state)",
     )
+    parser.add_argument(
+        "--additional-results-file", type=Path, default=None,
+        help="CSV journal of all new Donchian/daily evaluations (default: beside additional state)",
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Binance API origin (default: %(default)s)")
     parser.add_argument(
         "--additional-base-url",
@@ -1242,6 +1251,7 @@ def main(argv: list[str] | None = None) -> int:
         additional_state_path=additional_state_path,
         additional_client=additional_client,
         additional_base_url=additional_base_url,
+        additional_results_path=args.additional_results_file,
     )
     try:
         if args.once:
