@@ -95,7 +95,11 @@ def main() -> int:
         "ema_rows_added": [],
         "new_additional_rows": [],
         "transitions": [],
-        "latest_additional": {},
+        "latest_ema": report_row(rows_by_strategy["ema300-8h"][-1]),
+        "latest_additional": {
+            strategy: report_row(rows_by_strategy[strategy][-1])
+            for strategy in ("donchian-8h-20-10", "daily-ema6-24")
+        },
         "ticker_errors": [],
         "ticker_available": False,
         "historical_catch_up": False,
@@ -136,11 +140,6 @@ def main() -> int:
                 if row["signal_changed"] == "true"
             ]
             result["historical_catch_up"] = any(len(group) > 1 for group in new_rows.values())
-            result["latest_additional"] = {
-                strategy: report_row(rows[-1])
-                for strategy, rows in rows_by_strategy.items()
-                if strategy != "ema300-8h"
-            }
         (run / "ticker.json").write_text(
             json.dumps({"current_spot_price_usdt": "", "spot_ticker_observed_utc": "", "errors": []}, indent=2) + "\n",
             encoding="utf-8",

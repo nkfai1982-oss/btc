@@ -188,6 +188,27 @@ class PortfolioJournalTests(unittest.TestCase):
             self.assertEqual(payload["strategies"]["ema300-8h"]["pending_signal_target"], "LONG")
             self.assertEqual(len(self.rows(recovered.csv_paths["ema300-8h"])), 2)
 
+    def test_recovery_when_portfolio_state_is_ahead_of_signal_state_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = self.make_journal(tmp)
+            targets = {
+                "ema300-8h": "FLAT",
+                "donchian-8h-20-10": "CASH",
+                "daily-ema6-24": "CASH",
+            }
+            self.start(journal, targets)
+            event = self.event(1, INTERVAL_MS, 100.0, 105.0, "FLAT", "LONG")
+            self.assertTrue(journal.record_evaluation("ema300-8h", "BTCUSDT", "8h", event))
+
+            recovered = self.make_journal(tmp)
+            # The preserved signal JSON still says FLAT at the baseline timestamp.
+            self.start(recovered, targets, allow=False)
+            self.assertFalse(recovered.record_evaluation("ema300-8h", "BTCUSDT", "8h", event))
+            self.assertEqual(
+                recovered._load_state("BTCUSDT")["strategies"]["ema300-8h"]["pending_signal_target"],
+                "LONG",
+            )
+
     def test_conflicting_duplicate_and_missing_interval_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = self.make_journal(tmp)

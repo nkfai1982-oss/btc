@@ -1038,6 +1038,8 @@ class Monitor:
         if state is None or additional is None:
             return
         assert state.last_processed_open_time_ms is not None and state.last_close is not None
+        assert additional.last_8h_open_time_ms is not None
+        assert additional.last_daily_open_time_ms is not None
         try:
             self.portfolio_journal.ensure_started(
                 self.symbol,
@@ -1054,6 +1056,11 @@ class Monitor:
                 state.last_close,
                 state.last_processed_open_time_ms + INTERVAL_MS - 1,
                 allow_initialize=self.initialize_portfolio,
+                signal_time_ms_by_strategy={
+                    "ema300-8h": state.last_processed_open_time_ms + INTERVAL_MS - 1,
+                    "donchian-8h-20-10": additional.last_8h_open_time_ms + INTERVAL_MS - 1,
+                    "daily-ema6-24": additional.last_daily_open_time_ms + DAILY_INTERVAL_MS - 1,
+                },
             )
         except (OSError, ValueError) as exc:
             raise MonitorError(f"Could not validate or initialize portfolio logs: {exc}") from exc

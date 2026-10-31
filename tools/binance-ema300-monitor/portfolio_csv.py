@@ -239,6 +239,12 @@ class PortfolioJournal:
                 raise ValueError(f"Portfolio state position for {strategy} is invalid")
             if item.get("pending_signal_target") not in {"LONG", "FLAT", "BTC", "CASH"}:
                 raise ValueError(f"Portfolio state pending signal for {strategy} is invalid")
+            try:
+                int(item["last_mark_time_ms"])
+                if item.get("last_signal_time_ms") is not None:
+                    int(item["last_signal_time_ms"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Portfolio timestamps for {strategy} are invalid") from exc
         return payload
 
     def _save_state(self, payload: dict[str, Any]) -> None:
@@ -315,14 +321,23 @@ class PortfolioJournal:
         baseline_time_ms: int,
         *,
         allow_initialize: bool = False,
+        signal_time_ms_by_strategy: Mapping[str, int] | None = None,
     ) -> None:
         """Load an existing ledger or create a clean 1000-USDT baseline for all rules."""
         price = _positive_finite(baseline_price_usdt, "baseline price")
         if set(interval_by_strategy) != set(STRATEGIES) or set(targets) != set(STRATEGIES):
             raise ValueError("Portfolio initialization must include all three strategies")
+        signal_times = dict(signal_time_ms_by_strategy or {
+            strategy: int(baseline_time_ms) for strategy in STRATEGIES
+        })
+        if set(signal_times) != set(STRATEGIES):
+            raise ValueError("Signal timestamps must include all three strategies")
         if self.state_path.exists():
             self._state = self._load_state(symbol)
             for strategy in STRATEGIES:
+                item = self._state["strategies"][strategy]
+                if item.get("last_signal_time_ms") is None:
+                    item["last_signal_time_ms"] = int(signal_times[strategy])
                 path = self.csv_paths[strategy]
                 rows = _read_csv(path)
                 if not rows or rows[0] != self._state["baseline_rows"][strategy]:
@@ -370,6 +385,7 @@ class PortfolioJournal:
                         "equity_usdt": equity,
                         "last_price_usdt": close_price,
                         "last_mark_time_ms": last_time,
+                        "last_signal_time_ms": last_time,
                         "last_candle_open_time_ms": _timestamp_ms(last["candle_open_utc"]),
                     })
                 elif (
@@ -378,7 +394,12 @@ class PortfolioJournal:
                     or last["signal_target"] != item["pending_signal_target"]
                 ):
                     raise ValueError(f"Portfolio CSV and saved state disagree for {strategy}")
-                if not strategy_recovered and item["pending_signal_target"] != targets[strategy]:
+                signal_is_current = int(signal_times[strategy]) >= int(item["last_signal_time_ms"])
+                if (
+                    not strategy_recovered
+                    and signal_is_current
+                    and item["pending_signal_target"] != targets[strategy]
+                ):
                     raise ValueError(f"Portfolio pending target disagrees with saved signal state for {strategy}")
             self._save_state(self._state)
             return
@@ -411,6 +432,7 @@ class PortfolioJournal:
                 "equity_usdt": self.starting_capital_usdt,
                 "last_price_usdt": price,
                 "last_mark_time_ms": int(baseline_time_ms),
+                "last_signal_time_ms": int(signal_times[strategy]),
                 "last_candle_open_time_ms": None,
             }
             baseline_rows[strategy] = self._baseline_row(
@@ -449,6 +471,8 @@ class PortfolioJournal:
         if self._state is not None:
             self._state = payload
         item = payload["strategies"][strategy]
+        if item.get("last_signal_time_ms") is None:
+            item["last_signal_time_ms"] = int(item["last_mark_time_ms"])
         candle = event.candle
         close_time_ms = int(candle.close_time_ms)
         last_mark_time = int(item["last_mark_time_ms"])
@@ -573,6 +597,7 @@ class PortfolioJournal:
             "equity_usdt": equity,
             "last_price_usdt": close_price,
             "last_mark_time_ms": close_time_ms,
+            "last_signal_time_ms": close_time_ms,
             "last_candle_open_time_ms": int(candle.open_time_ms),
         })
         self._save_state(payload)
