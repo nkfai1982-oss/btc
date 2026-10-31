@@ -93,21 +93,22 @@ This is a local script, not a hosted or always-on service. It monitors only whil
 
 ## Tests
 
-The offline unit tests cover EMA recursion, LONG/FLAT hysteresis and deadband retention, strict Donchian thresholds, daily EMA equality exits, simultaneous independent signal changes, exclusion of incomplete candles, JSON state round-trip, startup-only short-row handling, gap reporting without synthesis, and the minimum history requirement. They use local fixtures and make no network requests.
+The offline unit tests cover EMA recursion, LONG/FLAT hysteresis and deadband retention, strict Donchian thresholds, daily EMA equality exits, simultaneous independent signal changes, exclusion of incomplete candles, JSON state round-trip, startup-only short-row handling, gap reporting without synthesis, the minimum history requirement, portfolio baselines, next-open execution, returns, daily partial-baseline handling, restart recovery, and malformed or out-of-order ledgers. They use local fixtures and make no network requests.
 
-## CSV tracking and recurring delivery
+## Separate portfolio CSVs
 
-The existing `signal_results.csv` is the EMA300 evaluation/snapshot log; its schema is unchanged. The added rules use a separate `additional_signal_results.csv`, one row for each newly evaluated completed 8-hour Donchian candle or completed UTC daily EMA candle. It records strategy, market, interval, candle-close timestamp and price, previous/current targets, whether the signal changed, both relevant Donchian thresholds or daily EMA values, and the effective next interval/day. It is an **evaluation journal**, not actual trades, fills, or realized investment returns.
+The old `signal_results.csv` and `additional_signal_results.csv` histories are replaced by three independent logs: `ema300_portfolio.csv`, `donchian_20_10_portfolio.csv`, and `daily_ema6_24_portfolio.csv`. Each strategy starts with its own 1,000 balance (3,000 total), modeled as 1,000 USDT per strategy at a 1 USDT = 1 USD assumption. The first `STARTING_BALANCE` row records the preserved signal target and the new tracking baseline; it does not reconstruct earlier portfolio returns.
+
+Each log contains signal state, execution action and price, BTC units, cash, portfolio value, profit/loss, period return, and cumulative return. Signals determined at a candle close are held as pending and applied at the next candle open. The ledger marks the existing position through any open-price gap, rebalances only at that open, and then marks to the candle close. The daily ledger handles a baseline inside a UTC daily candle from the baseline price rather than the candle's earlier open. These are simulated long-or-cash portfolios, not actual holdings or fills. They assume no fees, spread, slippage, taxes, interest, leverage, or short positions.
+
+The three JSON signal states remain separate and are not reset by this migration. Portfolio continuity is kept in `binance_portfolio_state.json` beside the active monitor's state files. Initialize a new portfolio explicitly once; initialization refuses to replace existing CSV history:
 
 ```bash
-python3 binance_ema300_monitor.py --once \
-  --state-file /workspace/binance-ema300-monitor/binance_ema300_state.json \
-  --additional-state-file /workspace/binance-ema300-monitor/binance_additional_signals_state.json \
-  --additional-results-file /workspace/btc/tools/binance-ema300-monitor/additional_signal_results.csv
+python3 binance_ema300_monitor.py --once --initialize-portfolio
 ```
 
-The added CSV is written **before** the additional-strategy state advances. Rows are deduplicated by strategy, symbol, and candle-close time, so retrying after a failed state save does not duplicate a row. File locking and atomic CSV replacement protect against concurrent CSV writers and partial writes; they do not make the two JSON states and alert delivery a single transaction. Only one monitor invocation should run at a time. Unchanged evaluations are logged but do not emit added-strategy alerts. The original EMA300 console output remains backward compatible; the recurring delivery instruction filters routine unchanged output.
+Subsequent runs should omit `--initialize-portfolio`. The monitor refuses to silently reset a missing, malformed, or mismatched portfolio ledger. Keep the portfolio state file together with the three CSVs when moving or restoring a running ledger. CSV writes are locked, atomic, and idempotent; the CSV is written before its JSON portfolio state so a retry can recover from an interrupted state write. The separate signal state, portfolio state, CSV sync, and chat delivery are not one transaction. Only one monitor invocation should run at a time.
 
-`RECOVERED_KNOWN_TRANSITION` marks the previously observed Donchian entry at 2026-10-21 07:59:59.999 UTC. `RECOVERED_LATEST_EVALUATION` marks the latest independently verified baseline evaluations. These recovered rows must not be sent as fresh alerts; no earlier performance history or trade execution is implied.
+`journal_captured_run.py <run-directory>` validates and syncs the three active CSVs into the repository. When the run directory has `ema_before.json` and `additional_before.json`, it also writes a `journal_result.json` summary containing only new evaluations and signal transitions for that run window. The monitor itself does not push Git or send chat messages.
 
-The recurring Cue check uses the existing cadence of **00:02, 08:02, and 16:02 Asia/Kuala_Lumpur**. Its owning scheduled-task instruction is responsible for committing and pushing both CSVs to `master` even when targets are unchanged. The script itself does not push Git or deliver chat messages. Reports are intended for the user's **direct chat**, not a group, and only when a strategy changes. If any strategy changes, the report includes all three strategies and their relevant thresholds, clearly distinguishing changed signals from unchanged context. The schedule-owner must apply the updated instruction; editing these files alone does not update scheduling or chat routing.
+The existing recurring check is intended to remain at **00:02, 08:02, and 16:02 Asia/Kuala_Lumpur**. Its owner must commit and push all three new CSVs to `master`, and send reports only to the user's direct chat when a target changes. Editing these files alone does not change the recurring task's delivery settings.

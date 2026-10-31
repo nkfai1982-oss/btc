@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 from signal_csv import append_evaluations, evaluation_row
+from portfolio_csv import PortfolioJournal
 
 INTERVAL = "8h"
 INTERVAL_MS = 8 * 60 * 60 * 1000
@@ -68,6 +69,7 @@ class Candle:
     open_time_ms: int
     close_price: float
     close_time_ms: int
+    open_price: float | None = None
 
 
 @dataclass
@@ -191,6 +193,7 @@ def parse_candle(row: Any, interval: str = INTERVAL) -> Candle:
         if isinstance(row[0], bool) or isinstance(row[6], bool):
             raise ValueError("boolean timestamp")
         open_time = int(row[0])
+        open_price = float(row[1])
         close = float(row[4])
         close_time = int(row[6])
     except (TypeError, ValueError, OverflowError) as exc:
@@ -214,9 +217,11 @@ def parse_candle(row: Any, interval: str = INTERVAL) -> Candle:
             f"Kline at {utc_timestamp(open_time)} has an unexpected {interval_label} close timestamp; "
             "refusing to process it."
         )
+    if not math.isfinite(open_price) or open_price <= 0:
+        raise MonitorError("Binance returned a non-positive or non-finite open price.")
     if not math.isfinite(close) or close <= 0:
         raise MonitorError("Binance returned a non-positive or non-finite close price.")
-    return Candle(open_time, close, close_time)
+    return Candle(open_time, close, close_time, open_price)
 
 
 def completed_candles(candles: Iterable[Candle], now_ms: int) -> list[Candle]:
@@ -776,6 +781,7 @@ class AdditionalSignalMonitor:
         stdout: Any = sys.stdout,
         stderr: Any = sys.stderr,
         results_path: Path | None = None,
+        portfolio_journal: PortfolioJournal | None = None,
     ) -> None:
         self.symbol = symbol
         self.base_url = normalize_base_url(base_url)
@@ -785,6 +791,7 @@ class AdditionalSignalMonitor:
         self.stderr = stderr
         self.config = make_additional_config(symbol, self.base_url)
         self.results_path = results_path or self.state_path.with_name("additional_signal_results.csv")
+        self.portfolio_journal = portfolio_journal
 
     def _say(self, message: str) -> None:
         print(message, file=self.stdout, flush=True)
@@ -938,11 +945,20 @@ class AdditionalSignalMonitor:
                 last_daily_open_time_ms=(new_daily[-1].open_time_ms if new_daily else state.last_daily_open_time_ms),
             )
             try:
-                append_evaluations(self.results_path, [
-                    evaluation_row(event, self.symbol, utc_timestamp) for event in evaluations
-                ])
+                if self.portfolio_journal is not None:
+                    for event in evaluations:
+                        self.portfolio_journal.record_evaluation(
+                            event.strategy,
+                            self.symbol,
+                            event.interval,
+                            event,
+                        )
+                else:
+                    append_evaluations(self.results_path, [
+                        evaluation_row(event, self.symbol, utc_timestamp) for event in evaluations
+                    ])
             except (OSError, ValueError) as exc:
-                raise MonitorError(f"Could not journal additional signals: {exc}; state not advanced") from exc
+                raise MonitorError(f"Could not journal additional portfolio: {exc}; state not advanced") from exc
             save_additional_state(updated, self.state_path)
         for event in events:
             self._report_event(event)
@@ -963,6 +979,12 @@ class Monitor:
         additional_client: BinancePublicClient | None = None,
         additional_base_url: str | None = None,
         additional_results_path: Path | None = None,
+        portfolio_state_path: Path | None = None,
+        ema300_portfolio_path: Path | None = None,
+        donchian_portfolio_path: Path | None = None,
+        daily_ema_portfolio_path: Path | None = None,
+        starting_capital_usdt: float = 1000.0,
+        initialize_portfolio: bool = False,
     ) -> None:
         self.symbol = symbol
         self.base_url = normalize_base_url(base_url)
@@ -973,6 +995,19 @@ class Monitor:
         self.config = make_config(symbol, self.base_url)
         self.last_no_data_notice_ms: int | None = None
         self.startup_announced = False
+        self.initialize_portfolio = initialize_portfolio
+        self.portfolio_journal = (
+            PortfolioJournal.alongside(
+                self.state_path,
+                portfolio_state_file=portfolio_state_path,
+                ema300_file=ema300_portfolio_path,
+                donchian_file=donchian_portfolio_path,
+                daily_ema_file=daily_ema_portfolio_path,
+                starting_capital_usdt=starting_capital_usdt,
+            )
+            if enable_additional_signals
+            else None
+        )
         self.additional_monitor = (
             AdditionalSignalMonitor(
                 symbol,
@@ -983,6 +1018,7 @@ class Monitor:
                 stdout=stdout,
                 stderr=stderr,
                 results_path=additional_results_path,
+                portfolio_journal=self.portfolio_journal,
             )
             if enable_additional_signals
             else None
@@ -990,6 +1026,37 @@ class Monitor:
 
     def _say(self, message: str) -> None:
         print(message, file=self.stdout, flush=True)
+
+    def _ensure_portfolio_started(self) -> None:
+        if self.portfolio_journal is None or self.additional_monitor is None:
+            return
+        state = load_state(self.state_path, self.config)
+        additional = load_additional_state(
+            self.additional_monitor.state_path,
+            self.additional_monitor.config,
+        )
+        if state is None or additional is None:
+            return
+        assert state.last_processed_open_time_ms is not None and state.last_close is not None
+        try:
+            self.portfolio_journal.ensure_started(
+                self.symbol,
+                {
+                    "ema300-8h": INTERVAL,
+                    "donchian-8h-20-10": INTERVAL,
+                    "daily-ema6-24": DAILY_INTERVAL,
+                },
+                {
+                    "ema300-8h": state.target,
+                    "donchian-8h-20-10": additional.donchian_target,
+                    "daily-ema6-24": additional.daily_target,
+                },
+                state.last_close,
+                state.last_processed_open_time_ms + INTERVAL_MS - 1,
+                allow_initialize=self.initialize_portfolio,
+            )
+        except (OSError, ValueError) as exc:
+            raise MonitorError(f"Could not validate or initialize portfolio logs: {exc}") from exc
 
     def _startup_status(self, state: MonitorState) -> None:
         assert state.ema is not None and state.last_processed_open_time_ms is not None
@@ -1037,6 +1104,7 @@ class Monitor:
         )
 
     def run_once(self, once: bool = True) -> None:
+        self._ensure_portfolio_started()
         ema_error: MonitorError | None = None
         additional_error: MonitorError | None = None
         try:
@@ -1048,6 +1116,7 @@ class Monitor:
                 self.additional_monitor.run_once()
             except MonitorError as exc:
                 additional_error = exc
+        self._ensure_portfolio_started()
         if ema_error is not None and additional_error is not None:
             raise MonitorError(
                 f"EMA300 check failed: {ema_error}; additional signal check failed: {additional_error}"
@@ -1158,6 +1227,22 @@ class Monitor:
         latest_expected = expected_latest_completed_open(now_ms)
         for candle in finished:
             event = apply_candle(state, candle)
+            if self.portfolio_journal is not None and self.portfolio_journal.is_initialized:
+                try:
+                    self.portfolio_journal.record_evaluation(
+                        "ema300-8h",
+                        self.symbol,
+                        INTERVAL,
+                        event,
+                        {
+                            "ema300_usdt": event.ema,
+                            "distance_pct": event.distance_pct,
+                        },
+                    )
+                except (OSError, ValueError) as exc:
+                    raise MonitorError(
+                        f"Could not journal EMA300 portfolio: {exc}; signal state not advanced"
+                    ) from exc
             save_state(state, self.state_path)
             self._print_event(event, catch_up=candle.open_time_ms < latest_expected)
 
@@ -1210,8 +1295,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--additional-results-file", type=Path, default=None,
-        help="CSV journal of all new Donchian/daily evaluations (default: beside additional state)",
+        help="legacy evaluation journal for standalone additional-signal use; main monitor uses portfolio CSVs",
     )
+    parser.add_argument("--portfolio-state-file", type=Path, default=None,
+                        help="persistent simulated portfolio state (default: binance_portfolio_state.json beside the signal state)")
+    parser.add_argument("--ema300-portfolio-file", type=Path, default=None,
+                        help="EMA300 portfolio CSV (default: ema300_portfolio.csv beside the signal state)")
+    parser.add_argument("--donchian-portfolio-file", type=Path, default=None,
+                        help="Donchian 20/10 portfolio CSV (default: donchian_20_10_portfolio.csv beside the signal state)")
+    parser.add_argument("--daily-ema-portfolio-file", type=Path, default=None,
+                        help="daily EMA6/24 portfolio CSV (default: daily_ema6_24_portfolio.csv beside the signal state)")
+    parser.add_argument("--starting-capital-usdt", type=positive_float, default=1000.0,
+                        help="starting balance for each independent strategy (default: 1000 USDT)")
+    parser.add_argument("--initialize-portfolio", action="store_true",
+                        help="explicitly create the three starting-balance rows once; refuses existing CSV history")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Binance API origin (default: %(default)s)")
     parser.add_argument(
         "--additional-base-url",
@@ -1252,6 +1349,12 @@ def main(argv: list[str] | None = None) -> int:
         additional_client=additional_client,
         additional_base_url=additional_base_url,
         additional_results_path=args.additional_results_file,
+        portfolio_state_path=args.portfolio_state_file,
+        ema300_portfolio_path=args.ema300_portfolio_file,
+        donchian_portfolio_path=args.donchian_portfolio_file,
+        daily_ema_portfolio_path=args.daily_ema_portfolio_file,
+        starting_capital_usdt=args.starting_capital_usdt,
+        initialize_portfolio=args.initialize_portfolio,
     )
     try:
         if args.once:

@@ -3,3 +3,4 @@ __pycache__/
 .*.lock
 binance_ema300_state.json
 binance_additional_signals_state.json
+binance_portfolio_state.json
